@@ -35,7 +35,7 @@ def sifre_kontrolu():
 if not sifre_kontrolu():
     st.stop()
 
-st.title("🔥 Alman İhale Dosyası (LV) Pasif Yangın Analiz Sistemi — FSU Ürünleri")
+st.title("LV Pasif Yangın Analiz Sistemi — FSU Ürünleri")
 st.markdown(
     "Bir veya birden fazla LV (PDF) dosyası yükleyin. Sistem her dosyayı tarayıp "
     "**sadece FSU ürünlerini** ayıklayacak ve sonuçları listeleyip Excel olarak indirmenizi sağlayacaktır."
