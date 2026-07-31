@@ -3,6 +3,7 @@ import io
 import time
 import json
 import re
+import tempfile
 import openpyxl
 import pdfplumber
 import streamlit as st
@@ -19,8 +20,7 @@ def sifre_kontrolu():
     def sifre_girildi():
         if st.session_state.get("girilen_sifre") == UYGULAMA_SIFRESI:
             st.session_state["dogrulandi"] = True
-            if "girilen_sifre" in st.session_state:
-                del st.session_state["girilen_sifre"]
+            del st.session_state["girilen_sifre"]
         else:
             st.session_state["dogrulandi"] = False
 
@@ -35,7 +35,7 @@ def sifre_kontrolu():
 if not sifre_kontrolu():
     st.stop()
 
-st.title("LV Pasif Yangın Analiz Sistemi — FSU Ürünleri")
+st.title("🔥 Alman İhale Dosyası (LV) Pasif Yangın Analiz Sistemi — FSU Ürünleri")
 st.markdown(
     "Bir veya birden fazla LV (PDF) dosyası yükleyin. Sistem her dosyayı tarayıp "
     "**sadece FSU ürünlerini** ayıklayacak ve sonuçları listeleyip Excel olarak indirmenizi sağlayacaktır."
@@ -111,10 +111,19 @@ Bu belgede adet bilgisi AYRI BİR TABLO SÜTUNUNDA değil, her pozun uzun açık
   ... ürün teknik açıklaması ... Feuerwiderstandsklasse [sınıf] ... Zulassungs-Nr. [onay no]. [ADET],000 [BİRİM]
 Yani doğru adet, genellikle o pozun paragrafındaki EN SON sayıdır ve hemen "Zulassungs-Nr." referansından SONRA, bir sonraki Poz-Nr. başlamadan HEMEN ÖNCE gelir. Bu son sayı çoğu zaman "St", "m", "m²" gibi bir birimle birlikte yazılıdır.
 
+GERÇEK ÖRNEK (bu belgeden, birebir bu kalıba dikkat et):
+Normal sırada metin şöyle akıyor: "...Wartungsfrei und ohne Inspektionsauflagen. Feuerwiderstandsklasse K 90-18017, Zulassungs-Nr. Z-41.3-368. 17,000 St"
+Burada:
+- "K 90-18017" → bu bir SINIF KODUDUR, adet DEĞİLDİR.
+- "Z-41.3-368" → bu bir ONAY NUMARASIDIR, adet DEĞİLDİR.
+- "17,000 St" → İŞTE DOĞRU ADET BUDUR (17, birim: St).
+Ters sırada bu bilgi ("17,000 St ... Zulassungs-Nr. Z-41.3-368 ...") ilgili pozun BAŞINA yakın gelecektir — bu sayede adet bilgisi çok daha kolay yakalanır.
+
 DİĞER KURALLAR:
 - Ürün açıklaması, kategori, üretici vb. YAZMA — sadece poz no + miktar + birim eşleşmesi istiyorum.
 - Poz numarasını TAM olarak (nokta dahil, örn: 01.01.0140) yaz, kısaltma.
-- Emin olmadığın bir poz için adet değerini boş bırak ("-" yaz), ASLA tahmin etme.
+- Bir pozun paragrafındaki DIN norm numaraları (DIN 18017 gibi), sınıf+onay kodları (K 90-18017, Z-41.3-368 gibi), Artikelnummer gibi ARA sayıları asla adet sanma. Adet, o pozun metninin GERÇEK SONUNDA (normal okumada), genelde bir birim kısaltmasıyla (St/m/m²/kg/Stk) birlikte yazan sayıdır.
+- Emin olmadığın bir poz için adet değerini boş bırak ("-" yaz), ASLA tahmin etme veya başka bir pozun değerini kopyalama.
 - TÜM belgeyi tara, hiçbir pozu atlama.
 
 Çıktıyı SADECE şu JSON yapısında ver, başka hiçbir açıklama yapma:
@@ -191,11 +200,19 @@ def temizle(ham_urunler, miktar_sozlugu=None):
         temiz_urunler.append(u)
     return temiz_urunler
 
+
 def pdf_ters_metin_cikar(pdf_yolu: str) -> str:
+    """
+    PDF sayfalarını TERS sırayla okur ve tek bir metin bloğu döndürür.
+    Amaç: Her pozun SONUNDA gelen adet bilgisi, ters okumada metnin
+    BAŞINA gelir ve model tarafından çok daha kolay tespit edilir.
+    pypdf/pikepdf gerektirmez; sadece pdfplumber kullanır.
+    """
     sayfalar = []
     with pdfplumber.open(pdf_yolu) as pdf:
         for sayfa in reversed(pdf.pages):
             metin = sayfa.extract_text(layout=False) or ""
+            # Sayfa numarası ve başlık satırlarını temizle
             temiz_satirlar = []
             for satir in metin.split("\n"):
                 s = satir.strip()
@@ -207,18 +224,32 @@ def pdf_ters_metin_cikar(pdf_yolu: str) -> str:
             sayfalar.append("\n".join(temiz_satirlar))
     return "\n".join(sayfalar)
 
-def miktar_tablosu_cikar(dosya, client, orijinal_pdf_yolu=None):
+
+def miktar_tablosu_cikar(dosya, client, durum_alani, orijinal_pdf_yolu=None):
+    """
+    Tersten okuma yöntemi:
+    PDF sayfaları pdfplumber ile TERS sırayla okunur ve metin string olarak
+    Gemini'ye gönderilir. Bu sayede her pozun SONUNDA gelen adet bilgisi,
+    modelin gördüğü metnin BAŞINA gelir ve çok daha kolay yakalanır.
+    Ters metin gönderilemezse orijinal PDF dosyasıyla fallback yapar.
+    """
+    # Ters metin oluştur
     ters_metin = None
     if orijinal_pdf_yolu:
         try:
             ters_metin = pdf_ters_metin_cikar(orijinal_pdf_yolu)
-        except Exception:
-            pass
+        except Exception as e:
+            durum_alani.warning(f"⚠️ Ters metin oluşturulamadı, orijinal PDF kullanılıyor: {e}")
 
     max_deneme = 3
     for deneme in range(max_deneme):
         try:
-            icerik = [ters_metin, PROMPT_MIKTAR] if ters_metin else [dosya, PROMPT_MIKTAR]
+            # Ters metin varsa text olarak, yoksa orijinal PDF dosyasıyla gönder
+            if ters_metin:
+                icerik = [ters_metin, PROMPT_MIKTAR]
+            else:
+                icerik = [dosya, PROMPT_MIKTAR]
+
             response = client.models.generate_content(
                 model="gemini-2.5-flash",
                 contents=icerik,
@@ -242,18 +273,23 @@ def miktar_tablosu_cikar(dosya, client, orijinal_pdf_yolu=None):
         except Exception as e:
             hata_mesaji = str(e)
             if "429" in hata_mesaji or "RESOURCE_EXHAUSTED" in hata_mesaji:
-                time.sleep((deneme + 1) * 15)
+                bekleme_suresi = (deneme + 1) * 30
+                durum_alani.warning(f"⚠️ Miktar tablosu için kota bekleniyor ({bekleme_suresi}sn)...")
+                time.sleep(bekleme_suresi)
             else:
+                durum_alani.warning(f"⚠️ Miktar tablosu çıkarılamadı: {e}. Ürün detaylarındaki adet kullanılacak.")
                 return {}
     return {}
 
-def analiz_et_guvenli(pdf_yolu, client):
+
+def analiz_et_guvenli(pdf_yolu, client, durum_alani):
     dosya = client.files.upload(file=pdf_yolu)
     while dosya.state.name == "PROCESSING":
-        time.sleep(2)
+        time.sleep(3)
         dosya = client.files.get(name=dosya.name)
 
-    miktar_sozlugu = miktar_tablosu_cikar(dosya, client, orijinal_pdf_yolu=pdf_yolu)
+    durum_alani.info(f"🔢 Miktar tablosu çıkarılıyor (tersten okuma): {os.path.basename(pdf_yolu)}...")
+    miktar_sozlugu = miktar_tablosu_cikar(dosya, client, durum_alani, orijinal_pdf_yolu=pdf_yolu)
 
     max_deneme = 5
     for deneme in range(max_deneme):
@@ -270,16 +306,35 @@ def analiz_et_guvenli(pdf_yolu, client):
                 data = json.loads(response.text)
                 ham_urunler = data.get("urunler", [])
                 temiz = temizle(ham_urunler, miktar_sozlugu)
+
+                with st.expander(f"🔍 Debug bilgisi: {os.path.basename(pdf_yolu)}"):
+                    st.write(f"Miktar tablosunda bulunan poz sayısı: **{len(miktar_sozlugu)}**")
+                    if miktar_sozlugu:
+                        st.write("Miktar tablosundan örnek (ilk 10 poz):")
+                        st.json(dict(list(miktar_sozlugu.items())[:10]))
+                    st.write(f"Gemini'nin bulduğu ham ürün sayısı: **{len(ham_urunler)}**")
+                    st.write(f"Filtre sonrası kalan ürün sayısı: **{len(temiz)}**")
+
                 return temiz
             return []
+
+        except json.JSONDecodeError as e:
+            durum_alani.error(f"JSON ayrıştırma hatası: {e}")
+            return []
+
         except Exception as e:
             hata_mesaji = str(e)
             if "429" in hata_mesaji or "RESOURCE_EXHAUSTED" in hata_mesaji:
-                time.sleep((deneme + 1) * 20)
+                bekleme_suresi = (deneme + 1) * 30
+                durum_alani.warning(f"⚠️ Kota sınırı (429) aşıldı. {bekleme_suresi} saniye bekleniyor ({deneme + 1}/{max_deneme})...")
+                time.sleep(bekleme_suresi)
             else:
-                st.error(f"⚠️ Dosya analiz edilirken hata oluştu: {e}")
+                durum_alani.error(f"Hata: {e}")
                 return []
+
+    durum_alani.error("❌ Maksimum deneme sınırına ulaşıldı, bu dosya atlandı.")
     return []
+
 
 yuklenen_dosyalar = st.file_uploader(
     "LV (PDF) Dosyalarını Seçin (birden fazla seçebilirsiniz)",
@@ -291,7 +346,7 @@ if yuklenen_dosyalar:
     st.info(f"📄 {len(yuklenen_dosyalar)} dosya yüklendi.")
 
     if not SECILEN_API_KEY:
-        st.error("❌ API key bulunamadı! Streamlit Secrets alanında GEMINI_API_KEY tanımlı olduğundan emin olun.")
+        st.warning("⚠️ API key bulunamadı. Lütfen secrets.toml dosyasına GEMINI_API_KEY değerini ekleyin.")
     elif st.button("🚀 Analizi Başlat", type="primary"):
         client = genai.Client(api_key=SECILEN_API_KEY)
 
@@ -303,17 +358,17 @@ if yuklenen_dosyalar:
 
         tum_urunler = []
         genel_progress = st.progress(0)
-        durum_yazisi = st.empty()
 
         for i, yuklenen_dosya in enumerate(yuklenen_dosyalar):
-            durum_yazisi.info(f"⏳ İşleniyor ({i+1}/{len(yuklenen_dosyalar)}): **{yuklenen_dosya.name}**")
+            durum_alani = st.empty()
+            durum_alani.info(f"⏳ İşleniyor: {yuklenen_dosya.name} ({i+1}/{len(yuklenen_dosyalar)})")
 
             gecici_yol = f"temp_{i}_{yuklenen_dosya.name}"
             with open(gecici_yol, "wb") as f:
                 f.write(yuklenen_dosya.getbuffer())
 
             try:
-                urunler = analiz_et_guvenli(gecici_yol, client)
+                urunler = analiz_et_guvenli(gecici_yol, client, durum_alani)
                 for u in urunler:
                     satir = [
                         yuklenen_dosya.name, str(u.get("poz_no", "")), str(u.get("urun_adi", "")),
@@ -328,13 +383,15 @@ if yuklenen_dosyalar:
                          "Üretici", "Model/Tip", "Dayanım", "Malzeme", "Uygulama", "Sertifika"],
                         satir
                     )))
+                durum_alani.success(f"✓ {yuklenen_dosya.name}: {len(urunler)} FSU ürünü bulundu.")
             finally:
                 if os.path.exists(gecici_yol):
                     os.remove(gecici_yol)
 
             genel_progress.progress((i + 1) / len(yuklenen_dosyalar))
 
-        durum_yazisi.empty() # İşlem bitince yükleniyor yazısını temizle
+            if i < len(yuklenen_dosyalar) - 1:
+                time.sleep(5)
 
         if tum_urunler:
             st.success(f"🎉 Tüm dosyalar tamamlandı! Toplam {len(tum_urunler)} FSU ürünü bulundu.")
