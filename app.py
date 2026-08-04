@@ -3,45 +3,93 @@ import io
 import time
 import json
 import re
-import tempfile
 import openpyxl
 import pdfplumber
 import streamlit as st
+import traceback
+from datetime import datetime
 from google import genai
 from google.genai import types
+from google.genai.errors import APIError
 
-# --- STREAMLIT ARAYÜZ AYARLARI ---
-st.set_page_config(page_title="Brandschutz LV Analiz Sistemi", layout="wide")
+# ==============================================================================
+# SPEICHERBASIERTES (RAM) LOGGING SYSTEM
+# ==============================================================================
+if "canli_loglar" not in st.session_state:
+    st.session_state["canli_loglar"] = []
 
-# --- BASİT ŞİFRE KORUMASI ---
+def log_ekle(seviye, mesaj):
+    zaman = datetime.now().strftime("%H:%M:%S")
+    st.session_state["canli_loglar"].append(f"[{zaman}] [{seviye}] {mesaj}")
+
+def log_ve_hata_yaz(hata_nesnesi, dosya_adi="General", islem_adi="Unbekannter Vorgang"):
+    # temp_X_ Präfix aus Dateinamen entfernen
+    temiz_dosya_adi = re.sub(r'^temp_\d+_', '', dosya_adi)
+    hata_turu = type(hata_nesnesi).__name__
+    hata_mesaji = str(hata_nesnesi)
+    tam_iz = traceback.format_exc()
+
+    log_mesaji = f"FEHLER | Datei: {temiz_dosya_adi} | Prozess: {islem_adi} | Typ: {hata_turu} | Nachricht: {hata_mesaji}"
+    log_ekle("ERROR", log_mesaji)
+
+    return {
+        "zeit": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "datei": temiz_dosya_adi,
+        "prozess": islem_adi,
+        "fehler_typ": hata_turu,
+        "fehler_nachricht": hata_mesaji,
+        "traceback": tam_iz
+    }
+
+# ==============================================================================
+# STREAMLIT SEITEN-EINSTELLUNGEN & PASSWORT-SCHUTZ
+# ==============================================================================
+st.set_page_config(page_title="LV Passiver Brandschutz Analysator", layout="wide")
+
 UYGULAMA_SIFRESI = "Yangin2026"
 
-def sifre_kontrolu():
-    def sifre_girildi():
-        if st.session_state.get("girilen_sifre") == UYGULAMA_SIFRESI:
+if "dogrulandi" not in st.session_state:
+    st.session_state["dogrulandi"] = False
+
+# --- ANMELDUNG / PASSWORT-EINGABE ---
+if not st.session_state["dogrulandi"]:
+    girilen_sifre = st.text_input("🔒 Passwort", type="password", key="login_pass")
+    
+    if girilen_sifre:
+        if girilen_sifre == UYGULAMA_SIFRESI:
             st.session_state["dogrulandi"] = True
-            del st.session_state["girilen_sifre"]
+            log_ekle("INFO", "Erfolgreich am System angemeldet.")
+            st.rerun()
         else:
-            st.session_state["dogrulandi"] = False
-
-    if st.session_state.get("dogrulandi", False):
-        return True
-
-    st.text_input("🔒 Şifre", type="password", on_change=sifre_girildi, key="girilen_sifre")
-    if "dogrulandi" in st.session_state and not st.session_state["dogrulandi"]:
-        st.error("❌ Yanlış şifre, tekrar deneyin.")
-    return False
-
-if not sifre_kontrolu():
+            st.error("❌ Falsches Passwort eingegeben.")
+            
     st.stop()
 
-st.title("LV Pasif Yangın Analiz Sistemi — FSU Ürünleri")
-st.markdown(
-    "Bir veya birden fazla LV (PDF) dosyası yükleyin. Sistem her dosyayı tarayıp "
-    "**sadece FSU ürünlerini** ayıklayacak ve sonuçları listeleyip Excel olarak indirmenizi sağlayacaktır."
-)
+# ==============================================================================
+# HAUPTANWENDUNG (NACH ERFOLGREICHER ANMELDUNG)
+# ==============================================================================
 
-# --- API KEY ---
+# --- SEITENLEISTE (LOG-PANEL) ---
+with st.sidebar:
+    with st.popover("⚙️ Systemprotokolle", use_container_width=True):
+        st.write("#### 📜 Live-Prozessverlauf")
+        if st.session_state["canli_loglar"]:
+            log_metni = "\n\n".join(st.session_state["canli_loglar"])
+            st.text_area(
+                label="Log-Stream",
+                value=log_metni,
+                height=350,
+                disabled=True,
+                label_visibility="collapsed"
+            )
+        else:
+            st.info("Noch keine Protokolle vorhanden.")
+
+# --- HAUPTBILDSCHIRM TITEL UND BESCHREIBUNG ---
+st.title("LV Passiver Brandschutz Analysator")
+st.write("Extrahiert automatisch passive Brandschutzprodukte (FSU) aus deutschen Leistungsverzeichnissen (LV) und erzeugt einen Excel-Bericht.")
+
+# API KEY HOLEN
 SECILEN_API_KEY = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
 
 PROMPT = """
@@ -64,27 +112,23 @@ Bir ürün ancak aşağıdaki gibi bir yapı elemanından (duvar, döşeme, tava
 - Brandschutzklappe (yangın damperi/kelebek vanası - kanal içine monte edilen, F/K sınıfı olan)
 - Brandschutzmanschette / Rohrmanschette / Brandmanschette (yanıcı boru manşonu)
 - Brandschutzkissen (yangın yastığı/torbası)
-- Deckenschott / Bodenschott / Wandschott (tavan/döşeme/duvar geçiş durdurucusu — dikkat: bunlar "Wand"/"Dach" kelimesi geçse bile FSU'dur çünkü asıl işlev geçiş mühürlemesidir, bunu ele geçirme)
+- Deckenschott / Bodenschott / Wandschott (tavan/döşeme/duvar geçiş durdurucusu — dikkat: melez parçalar dahi mühürleme işlevindeyse dahil et)
 - İçinde "Brandschutz" + "Schott/Klappe/Manschette/Kissen/Abschottung" birlikte geçen ürünler
-Bu ürünlerin GENELDE (her zaman değil) bir yangın dayanım sınıfı (F30, F90, K30, K90, S90, R30 vb.) ve bir yapı onay/Zulassungsnummer'ı (Z-19.xx, Z-41.xx, abP, ETA vb.) olur — bu bilgiler varsa güçlü bir FSU işaretidir, ama olmaması otomatik ret sebebi değildir, önce yukarıdaki tanıma bak.
+Bu ürünlerin GENELDE bir yangın dayanım sınıfı (F30, F90, K30, K90, S90, R30 vb.) ve bir yapı onay/Zulassungsnummer'ı (Z-19.xx, Z-41.xx, abP, ETA vb.) olur.
 
 🚫 KESİNLİKLE FSU DEĞİL - ASLA SEÇME:
-Genel havalandırma/HVAC ekipmanı FSU DEĞİLDİR, yangınla ilgisi olmayan hava akışını sağlayan/yönlendiren parçalardır:
-- Ventilatoreinsatz, Montagehalterung, Zweitraumset, Innenblende, Rohbauset, Fassadenblende (genel montaj/adaptör parçaları)
-- Wetterschutzgitter (hava koşulu koruma ızgarası), Luftdurchlass (hava difüzörü), Volumenstromregelgerät/VVS Regelgerät (debi kontrol), Zusatzschalldämpfer (susturucu)
-- Sadece çatı/duvar geçişi için genel kılıf/manto olup yangın mühürleme işlevi belirtilmeyen "Dachdurchführung", "Wanddurchführung", "Dachschneidemantel", "Lüftungsleitung" (bunlar sadece montaj kılıfıdır, mühürleme sistemi değildir — ancak açıkça "Brandschutz-Wanddurchführung" gibi yangın onayı belirtilen bir ürünse bu istisnadır, dikkatli oku)
-Şüphen varsa ve ürün açıkça yukarıdaki beyaz listedeki bir kategoriye girmiyorsa, DAHİL ETME.
+Genel havalandırma/HVAC ekipmanı FSU DEĞİLDİR:
+- Ventilatoreinsatz, Montagehalterung, Zweitraumset, Innenblende, Rohbauset, Fassadenblende
+- Wetterschutzgitter, Luftdurchlass, Volumenstromregelgerät/VVS Regelgerät, Zusatzschalldämpfer
+- Sadece çatı/duvar geçişi için genel kılıf/manto olup yangın mühürleme işlevi belirtilmeyen "Dachdurchführung", "Wanddurchführung", "Dachschneidemantel", "Lüftungsleitung"
 
 🚨 UYDURMA / HALÜSİNASYON YASAĞI:
-- **uygulama_alani**: Metinde ürünün binanın neresine takılacağı açıkça yazmıyorsa (örn: Kat 2, Büro 104 vb.), mahalleri veya duvar tiplerini (Massivwände, Leichtbauwände vb.) UYDURMA. Yazmıyorsa "-" bırak.
+- **uygulama_alani**: Metinde ürünün binanın neresine takılacağı açıkça yazmıyorsa "-", yazmıyorsa uydurma.
 
 📏 DİĞER KURALLAR:
-- **urun_olcusu**: SADECE ürünün fiziksel boyutunu/çapını yaz (Örn: 1000x700x500 mm, DN100, çap 125 mm). Bu bilgi genelde "Nenngröße", "Abmessung", "Durchmesser", "Baugröße" ifadelerinin yanında veya ürün adının sonunda (örn: "Deckenschott 100" → 100) geçer.
-  KESİNLİKLE ÖLÇÜ SAYMA: DIN/EN/ISO norm referans numaraları (örn: "DIN 18017", "DIN 24145", "EN 1366-3"), yangın dayanım sınıfı + onay kodu birleşimleri (örn: "K 90-18017", "F90-Z-19.11-123" — bunların hepsi yangin_dayanimi/sertifika_ref alanına gider, ölçü değildir), Artikelnummer/ürün kodları. Bu tür sayıları gördüğünde ölçü alanına ASLA yazma. Metinde gerçek bir fiziksel boyut geçmiyorsa "-" bırak.
-- **uretici**: "KA2-EU-DE" veya benzeri standart kodları ASLA üretici olamaz. Üretici sadece TROX, Hilti, Helios vb. gerçek firma adıdır. Emin değilsen "-" yap.
-- **sertifika_ref**: Devasa norm zincirlerini yazma, sadece kısa onay numarasını yaz.
-
-TÜM SAYFALARI TARA VE HİÇBİR SATIRI ATLAMA.
+- **urun_olcusu**: SADECE ürünün fiziksel boyutunu/çapını yaz (Örn: 1000x700x500 mm, DN100).
+- **uretici**: "KA2-EU-DE" gibi kodlar üretici değildir. Üretici sadece gerçek firma adıdır.
+- **sertifika_ref**: Sadece kısa onay numarasını yaz.
 
 Çıktıyı SADECE şu JSON yapısında ver, başka hiçbir açıklama yapma:
 {
@@ -103,30 +147,18 @@ Bu bir Alman ihale dosyası (LV - Leistungsverzeichnis). Görevin SADECE şudur:
 Belgedeki HER TEK pozisyon (Poz-Nr.) için Menge (miktar/adet) ve Einheit (birim, örn: St, m, m², kg) değerlerini eksiksiz çıkarmak.
 
 ⚠️ ÖNEMLİ NOT - TERS OKUMA MODELİ:
-Bu belge SAYFALARI TERS SIRADA sunulmuştur (son sayfa önce, ilk sayfa sonda). Bu kasıtlı yapılmıştır çünkü adet bilgisi her pozun metninin SONUNDA gelir — ters okumada bu bilgi artık her pozun metninin BAŞINDA yer alır ve çok daha kolay tespit edilir.
-Okuma yönün değişmiş olsa da poz numaralarını TAM olarak (nokta dahil) çıkar ve doğru adet/birimle eşleştir.
+Bu belge SAYFALARI TERS SIRADA sunulmıştır. 
 
 🎯 BU BELGENİN YAPISI:
-Bu belgede adet bilgisi AYRI BİR TABLO SÜTUNUNDA değil, her pozun uzun açıklama metninin (Langtext) EN SONUNDA (normal okuma sırasında), serbest metin içinde geçiyor. Tipik sıralama şöyledir:
-  ... ürün teknik açıklaması ... Feuerwiderstandsklasse [sınıf] ... Zulassungs-Nr. [onay no]. [ADET],000 [BİRİM]
-Yani doğru adet, genellikle o pozun paragrafındaki EN SON sayıdır ve hemen "Zulassungs-Nr." referansından SONRA, bir sonraki Poz-Nr. başlamadan HEMEN ÖNCE gelir. Bu son sayı çoğu zaman "St", "m", "m²" gibi bir birimle birlikte yazılıdır.
-
-GERÇEK ÖRNEK (bu belgeden, birebir bu kalıba dikkat et):
-Normal sırada metin şöyle akıyor: "...Wartungsfrei und ohne Inspektionsauflagen. Feuerwiderstandsklasse K 90-18017, Zulassungs-Nr. Z-41.3-368. 17,000 St"
-Burada:
-- "K 90-18017" → bu bir SINIF KODUDUR, adet DEĞİLDİR.
-- "Z-41.3-368" → bu bir ONAY NUMARASIDIR, adet DEĞİLDİR.
-- "17,000 St" → İŞTE DOĞRU ADET BUDUR (17, birim: St).
-Ters sırada bu bilgi ("17,000 St ... Zulassungs-Nr. Z-41.3-368 ...") ilgili pozun BAŞINA yakın gelecektir — bu sayede adet bilgisi çok daha kolay yakalanır.
+Adet bilgisi serbest metin içinde, genellikle o pozun metninin EN SONUNDA geçiyor ("...Zulassungs-Nr. Z-41.3-368. 17,000 St").
 
 DİĞER KURALLAR:
-- Ürün açıklaması, kategori, üretici vb. YAZMA — sadece poz no + miktar + birim eşleşmesi istiyorum.
-- Poz numarasını TAM olarak (nokta dahil, örn: 01.01.0140) yaz, kısaltma.
-- Bir pozun paragrafındaki DIN norm numaraları (DIN 18017 gibi), sınıf+onay kodları (K 90-18017, Z-41.3-368 gibi), Artikelnummer gibi ARA sayıları asla adet sanma. Adet, o pozun metninin GERÇEK SONUNDA (normal okumada), genelde bir birim kısaltmasıyla (St/m/m²/kg/Stk) birlikte yazan sayıdır.
-- Emin olmadığın bir poz için adet değerini boş bırak ("-" yaz), ASLA tahmin etme veya başka bir pozun değerini kopyalama.
-- TÜM belgeyi tara, hiçbir pozu atlama.
+- Ürün açıklaması, kategori, üretici vb. YAZMA — sadece poz no + miktar + birim eşleşmesi.
+- Poz numarasını TAM olarak (nokta dahil) yaz.
+- DIN norm numaralarını, sınıf kodlarını adet sanma.
+- Emin olmadığın poz için adet değerini "-" yap.
 
-Çıktıyı SADECE şu JSON yapısında ver, başka hiçbir açıklama yapma:
+Çıktıyı SADECE şu JSON yapısında ver:
 {
   "pozlar": [
     {"poz_no": "...", "adet": "...", "birim": "..."}
@@ -202,53 +234,43 @@ def temizle(ham_urunler, miktar_sozlugu=None):
 
 
 def pdf_ters_metin_cikar(pdf_yolu: str) -> str:
-    """
-    PDF sayfalarını TERS sırayla okur ve tek bir metin bloğu döndürür.
-    Amaç: Her pozun SONUNDA gelen adet bilgisi, ters okumada metnin
-    BAŞINA gelir ve model tarafından çok daha kolay tespit edilir.
-    pypdf/pikepdf gerektirmez; sadece pdfplumber kullanır.
-    """
     sayfalar = []
-    with pdfplumber.open(pdf_yolu) as pdf:
-        for sayfa in reversed(pdf.pages):
-            metin = sayfa.extract_text(layout=False) or ""
-            # Sayfa numarası ve başlık satırlarını temizle
-            temiz_satirlar = []
-            for satir in metin.split("\n"):
-                s = satir.strip()
-                if re.match(r'^Seite\s+\d+', s, re.IGNORECASE):
-                    continue
-                if re.match(r'^(OZ\s+BESCHREIBUNG|Alle\s+Einzelpreise)', s, re.IGNORECASE):
-                    continue
-                temiz_satirlar.append(satir)
-            sayfalar.append("\n".join(temiz_satirlar))
-    return "\n".join(sayfalar)
+    try:
+        with pdfplumber.open(pdf_yolu) as pdf:
+            for sayfa in reversed(pdf.pages):
+                metin = sayfa.extract_text(layout=False) or ""
+                temiz_satirlar = []
+                for satir in metin.split("\n"):
+                    s = satir.strip()
+                    if re.match(r'^Seite\s+\d+', s, re.IGNORECASE):
+                        continue
+                    if re.match(r'^(OZ\s+BESCHREIBUNG|Alle\s+Einzelpreise)', s, re.IGNORECASE):
+                        continue
+                    temiz_satirlar.append(satir)
+                sayfalar.append("\n".join(temiz_satirlar))
+        return "\n".join(sayfalar)
+    except Exception as e:
+        log_ve_hata_yaz(e, dosya_adi=os.path.basename(pdf_yolu), islem_adi="pdf_ters_metin_cikar")
+        raise e
 
 
 def miktar_tablosu_cikar(dosya, client, durum_alani, orijinal_pdf_yolu=None):
-    """
-    Tersten okuma yöntemi:
-    PDF sayfaları pdfplumber ile TERS sırayla okunur ve metin string olarak
-    Gemini'ye gönderilir. Bu sayede her pozun SONUNDA gelen adet bilgisi,
-    modelin gördüğü metnin BAŞINA gelir ve çok daha kolay yakalanır.
-    Ters metin gönderilemezse orijinal PDF dosyasıyla fallback yapar.
-    """
-    # Ters metin oluştur
+    ham_dosya_adi = os.path.basename(orijinal_pdf_yolu) if orijinal_pdf_yolu else "Unbekanntes PDF"
+    dosya_adi = re.sub(r'^temp_\d+_', '', ham_dosya_adi)
+    
+    log_ekle("INFO", f"[{dosya_adi}] Schritt 1/2: Mengentabelle wird gescannt...")
+    
     ters_metin = None
     if orijinal_pdf_yolu:
         try:
             ters_metin = pdf_ters_metin_cikar(orijinal_pdf_yolu)
-        except Exception as e:
-            durum_alani.warning(f"⚠️ Ters metin oluşturulamadı, orijinal PDF kullanılıyor: {e}")
+        except Exception:
+            durum_alani.warning(f"⚠️ Umgekehrter Text konnte nicht erstellt werden, Original-PDF wird verwendet.")
 
     max_deneme = 3
     for deneme in range(max_deneme):
         try:
-            # Ters metin varsa text olarak, yoksa orijinal PDF dosyasıyla gönder
-            if ters_metin:
-                icerik = [ters_metin, PROMPT_MIKTAR]
-            else:
-                icerik = [dosya, PROMPT_MIKTAR]
+            icerik = [ters_metin, PROMPT_MIKTAR] if ters_metin else [dosya, PROMPT_MIKTAR]
 
             response = client.models.generate_content(
                 model="gemini-2.5-flash",
@@ -271,26 +293,35 @@ def miktar_tablosu_cikar(dosya, client, durum_alani, orijinal_pdf_yolu=None):
                 return sozluk
             return {}
         except Exception as e:
-            hata_mesaji = str(e)
-            if "429" in hata_mesaji or "RESOURCE_EXHAUSTED" in hata_mesaji:
-                bekleme_suresi = (deneme + 1) * 30
-                durum_alani.warning(f"⚠️ Miktar tablosu için kota bekleniyor ({bekleme_suresi}sn)...")
-                time.sleep(bekleme_suresi)
+            log_ve_hata_yaz(e, dosya_adi=dosya_adi, islem_adi=f"miktar_tablosu_cikar (Versuch {deneme+1})")
+            err_str = str(e)
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "503" in err_str or "UNAVAILABLE" in err_str:
+                wait_time = (deneme + 1) * 15
+                log_ekle("WARNING", f"[{dosya_adi}] API-Überlastung/Rate-Limit. Wartezeit: {wait_time}s...")
+                time.sleep(wait_time)
             else:
-                durum_alani.warning(f"⚠️ Miktar tablosu çıkarılamadı: {e}. Ürün detaylarındaki adet kullanılacak.")
                 return {}
     return {}
 
 
 def analiz_et_guvenli(pdf_yolu, client, durum_alani):
-    dosya = client.files.upload(file=pdf_yolu)
-    while dosya.state.name == "PROCESSING":
-        time.sleep(3)
-        dosya = client.files.get(name=dosya.name)
+    ham_dosya_adi = os.path.basename(pdf_yolu)
+    dosya_adi = re.sub(r'^temp_\d+_', '', ham_dosya_adi)
 
-    durum_alani.info(f"🔢 Miktar tablosu çıkarılıyor (tersten okuma): {os.path.basename(pdf_yolu)}...")
+    try:
+        dosya = client.files.upload(file=pdf_yolu)
+        while dosya.state.name == "PROCESSING":
+            time.sleep(2)
+            dosya = client.files.get(name=dosya.name)
+    except Exception as e:
+        log_ve_hata_yaz(e, dosya_adi=dosya_adi, islem_adi="client.files.upload")
+        raise e
+
+    durum_alani.info(f"🔢 Mengentabelle wird extrahiert: {dosya_adi}...")
     miktar_sozlugu = miktar_tablosu_cikar(dosya, client, durum_alani, orijinal_pdf_yolu=pdf_yolu)
 
+    log_ekle("INFO", f"[{dosya_adi}] Schritt 2/2: FSU-Produktanalyse läuft...")
+    
     max_deneme = 5
     for deneme in range(max_deneme):
         try:
@@ -306,68 +337,69 @@ def analiz_et_guvenli(pdf_yolu, client, durum_alani):
                 data = json.loads(response.text)
                 ham_urunler = data.get("urunler", [])
                 temiz = temizle(ham_urunler, miktar_sozlugu)
-
-                with st.expander(f"🔍 Debug bilgisi: {os.path.basename(pdf_yolu)}"):
-                    st.write(f"Miktar tablosunda bulunan poz sayısı: **{len(miktar_sozlugu)}**")
-                    if miktar_sozlugu:
-                        st.write("Miktar tablosundan örnek (ilk 10 poz):")
-                        st.json(dict(list(miktar_sozlugu.items())[:10]))
-                    st.write(f"Gemini'nin bulduğu ham ürün sayısı: **{len(ham_urunler)}**")
-                    st.write(f"Filtre sonrası kalan ürün sayısı: **{len(temiz)}**")
-
+                
+                log_ekle("SUCCESS", f"[{dosya_adi}] Gefilterte FSU-Anzahl: {len(temiz)}")
                 return temiz
             return []
 
-        except json.JSONDecodeError as e:
-            durum_alani.error(f"JSON ayrıştırma hatası: {e}")
-            return []
-
         except Exception as e:
-            hata_mesaji = str(e)
-            if "429" in hata_mesaji or "RESOURCE_EXHAUSTED" in hata_mesaji:
-                bekleme_suresi = (deneme + 1) * 30
-                durum_alani.warning(f"⚠️ Kota sınırı (429) aşıldı. {bekleme_suresi} saniye bekleniyor ({deneme + 1}/{max_deneme})...")
-                time.sleep(bekleme_suresi)
+            log_ve_hata_yaz(e, dosya_adi=dosya_adi, islem_adi=f"generate_content (Versuch {deneme+1})")
+            err_str = str(e)
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "503" in err_str or "UNAVAILABLE" in err_str:
+                wait_time = (deneme + 1) * 15
+                log_ekle("WARNING", f"[{dosya_adi}] Server beschäftigt/Limit erreicht. Warte {wait_time} Sekunden...")
+                time.sleep(wait_time)
             else:
-                durum_alani.error(f"Hata: {e}")
-                return []
+                if deneme == max_deneme - 1:
+                    raise e
+                time.sleep(3)
 
-    durum_alani.error("❌ Maksimum deneme sınırına ulaşıldı, bu dosya atlandı.")
     return []
 
-
+# ==============================================================================
+# DATEI-UPLOAD UND PROZESS-BEDIENFELD
+# ==============================================================================
 yuklenen_dosyalar = st.file_uploader(
-    "LV (PDF) Dosyalarını Seçin (birden fazla seçebilirsiniz)",
+    "LV-Dateien (PDF) auswählen",
     type=["pdf"],
     accept_multiple_files=True
 )
 
 if yuklenen_dosyalar:
-    st.info(f"📄 {len(yuklenen_dosyalar)} dosya yüklendi.")
+    st.info(f"📄 {len(yuklenen_dosyalar)} Datei(en) ausgewählt.")
 
     if not SECILEN_API_KEY:
-        st.warning("⚠️ API key bulunamadı. Lütfen secrets.toml dosyasına GEMINI_API_KEY değerini ekleyin.")
-    elif st.button("🚀 Analizi Başlat", type="primary"):
+        st.error("⚠️ GEMINI_API_KEY fehlt! Bitte überprüfen Sie Ihre secrets.toml Datei.")
+    elif st.button("🚀 Analyse starten", type="primary"):
+        log_ekle("INFO", "ANALYSE GESTARTET...")
+        
+        st.session_state["analiz_sonuclari"] = []
         client = genai.Client(api_key=SECILEN_API_KEY)
+
+        # Deutshe Spaltenüberschriften für Excel
+        spalten_de = [
+            "PDF-Datei", "Pos.-Nr.", "Produktname", "Abmessung", "Kategorie", 
+            "Menge", "Einheit", "Hersteller", "Modell/Typ", "Feuerwiderstand", 
+            "Material", "Anwendungsbereich", "Zertifikat-Ref"
+        ]
 
         wb = openpyxl.Workbook()
         ws = wb.active
-        ws.title = "Yangin Urunleri"
-        ws.append(["PDF", "Poz", "Ürün Adı", "Ölçü", "Kategori", "Adet", "Birim",
-                   "Üretici", "Model/Tip", "Dayanım", "Malzeme", "Uygulama", "Sertifika"])
+        ws.title = "Brandschutzprodukte"
+        ws.append(spalten_de)
 
         tum_urunler = []
         genel_progress = st.progress(0)
 
         for i, yuklenen_dosya in enumerate(yuklenen_dosyalar):
             durum_alani = st.empty()
-            durum_alani.info(f"⏳ İşleniyor: {yuklenen_dosya.name} ({i+1}/{len(yuklenen_dosyalar)})")
+            durum_alani.info(f"⏳ In Bearbeitung: {yuklenen_dosya.name} ({i+1}/{len(yuklenen_dosyalar)})")
 
             gecici_yol = f"temp_{i}_{yuklenen_dosya.name}"
-            with open(gecici_yol, "wb") as f:
-                f.write(yuklenen_dosya.getbuffer())
-
             try:
+                with open(gecici_yol, "wb") as f:
+                    f.write(yuklenen_dosya.getbuffer())
+
                 urunler = analiz_et_guvenli(gecici_yol, client, durum_alani)
                 for u in urunler:
                     satir = [
@@ -378,35 +410,42 @@ if yuklenen_dosyalar:
                         str(u.get("uygulama_alani", "")), str(u.get("sertifika_ref", ""))
                     ]
                     ws.append(satir)
-                    tum_urunler.append(dict(zip(
-                        ["PDF", "Poz", "Ürün Adı", "Ölçü", "Kategori", "Adet", "Birim",
-                         "Üretici", "Model/Tip", "Dayanım", "Malzeme", "Uygulama", "Sertifika"],
-                        satir
-                    )))
-                durum_alani.success(f"✓ {yuklenen_dosya.name}: {len(urunler)} FSU ürünü bulundu.")
+                    tum_urunler.append(dict(zip(spalten_de, satir)))
+                
+                durum_alani.success(f"✓ {yuklenen_dosya.name}: {len(urunler)} FSU-Produkt(e) gefunden.")
+
+            except Exception as genel_hata:
+                log_ve_hata_yaz(genel_hata, dosya_adi=yuklenen_dosya.name, islem_adi="Datei-Analyse-Schleife")
+                st.error(f"🚨 Fehler beim Verarbeiten von **{yuklenen_dosya.name}**.")
             finally:
                 if os.path.exists(gecici_yol):
                     os.remove(gecici_yol)
 
             genel_progress.progress((i + 1) / len(yuklenen_dosyalar))
 
-            if i < len(yuklenen_dosyalar) - 1:
-                time.sleep(5)
+        excel_buffer = io.BytesIO()
+        wb.save(excel_buffer)
+        
+        st.session_state["analiz_sonuclari"] = tum_urunler
+        st.session_state["excel_data"] = excel_buffer.getvalue()
+        
+        log_ekle("INFO", "VERARBEITUNG ABGESCHLOSSEN...")
+        st.rerun()
 
-        if tum_urunler:
-            st.success(f"🎉 Tüm dosyalar tamamlandı! Toplam {len(tum_urunler)} FSU ürünü bulundu.")
-            st.subheader("📊 Bulunan FSU Ürünlerinin Önizlemesi")
-            st.dataframe(tum_urunler, use_container_width=True)
+# --- ERGEBNISANZEIGE ---
+if st.session_state.get("analiz_sonuclari"):
+    tum_urunler = st.session_state["analiz_sonuclari"]
+    excel_bytes = st.session_state.get("excel_data")
 
-            excel_buffer = io.BytesIO()
-            wb.save(excel_buffer)
-            excel_buffer.seek(0)
+    st.success(f"🎉 Vorgang abgeschlossen! Insgesamt {len(tum_urunler)} FSU-Produkte identifiziert.")
+    st.subheader("📊 Analyseteergebnisse")
+    st.dataframe(tum_urunler, use_container_width=True)
 
-            st.download_button(
-                label="📥 Excel Çıktısını İndir (.xlsx)",
-                data=excel_buffer,
-                file_name="Yangin_Urunleri_Final.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-        else:
-            st.warning("⚠️ Dosyalar tarandı ancak uygun FSU ürünü bulunamadı.")
+    if excel_bytes:
+        st.download_button(
+            label="📥 Excel-Bericht herunterladen (.xlsx)",
+            data=excel_bytes,
+            file_name="Brandschutz_Produkte_Final.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary"
+        )
